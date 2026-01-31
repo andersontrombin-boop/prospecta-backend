@@ -2,7 +2,7 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Any, Dict
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -14,9 +14,8 @@ from dotenv import load_dotenv
 # =========================
 load_dotenv()
 
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 DB_PATH = os.getenv("DB_PATH", "app.db")
 
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
@@ -67,6 +66,8 @@ init_db()
 # =========================
 class LicenseCreate(BaseModel):
     license_key: str
+    # ✅ Para funcionar no Swagger sem header
+    api_key: Optional[str] = None
 
 
 class PixCreate(BaseModel):
@@ -94,15 +95,18 @@ def parse_iso(s: str) -> Optional[datetime]:
         return None
 
 
-def mp_headers() -> dict:
-    """Headers padrão do Mercado Pago (inclui X-Idempotency-Key obrigatório)."""
-    if not MP_ACCESS_TOKEN:
-        return {}
-    return {
-        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        "X-Idempotency-Key": str(uuid.uuid4()),
-    }
+def get_admin_key(request: Request, body_api_key: Optional[str]) -> str:
+    # ✅ Aceita header OU body
+    return (request.headers.get("x-api-key") or body_api_key or "").strip()
+
+
+def ensure_admin(request: Request, body_api_key: Optional[str]):
+    if not ADMIN_API_KEY:
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY não configurado no Render")
+
+    sent = get_admin_key(request, body_api_key)
+    if sent != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Não autorizado")
 
 
 # =========================
@@ -115,15 +119,7 @@ def health():
 
 @app.post("/admin/create-license")
 def create_license(body: LicenseCreate, request: Request):
-    # 1) aceita header padrão x-api-key
-    if request.headers.get("x-api-key") != ADMIN_API_KEY:
-        # 2) fallback: se você mandar api_key no JSON (como você fez no Swagger),
-        #    também funciona. (Não é obrigatório, mas ajuda quem é leigo.)
-        try:
-            raw = request._body if hasattr(request, "_body") else None
-        except:
-            raw = None
-        raise HTTPException(status_code=401, detail="Não autorizado")
+    ensure_admin(request, body.api_key)
 
     conn = db()
     cur = conn.cursor()
@@ -171,64 +167,66 @@ def validate_license(key: str):
 @app.post("/pix/create")
 def create_pix(body: PixCreate):
     if not MP_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="Mercado Pago não configurado")
+        raise HTTPException(status_code=500, detail="Mercado Pago não configurado (MP_ACCESS_TOKEN vazio)")
 
-    headers = mp_headers()
+    # (Opcional) validar licença existe
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM licenses WHERE license_key=?", (body.license_key,))
+    lic = cur.fetchone()
+    conn.close()
+
+    if not lic:
+        raise HTTPException(status_code=404, detail="license_key não encontrada. Crie a licença antes.")
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        # ✅ obrigatório pro MP não reclamar (idempotência)
+        "X-Idempotency-Key": str(uuid.uuid4()),
+    }
 
     payload = {
         "transaction_amount": float(body.amount),
         "description": f"Licença {body.license_key}",
         "payment_method_id": "pix",
-        "payer": {"email": "test_user_123@test.com"},
-        "metadata": {"license_key": body.license_key},
+        # MP costuma aceitar sem payer em alguns casos, mas é mais estável mandar um email dummy
+        "payer": {
+            "email": "test_user_123@test.com"
+        }
     }
 
-    response = requests.post(
+    resp = requests.post(
         "https://api.mercadopago.com/v1/payments",
         headers=headers,
         json=payload,
         timeout=60
     )
 
-    # Mercado Pago costuma retornar json com detalhes do erro
-    if response.status_code not in (200, 201):
-        try:
-            detail = response.json()
-        except:
-            detail = response.text
-        raise HTTPException(status_code=500, detail=detail)
+    # Mercado Pago manda erros detalhados no body
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=resp.text)
 
-    data = response.json()
+    data: Dict[str, Any] = resp.json()
 
-    # salva pagamento
-    mp_payment_id = str(data.get("id", ""))
-    status = str(data.get("status", ""))
-    created_at = iso(now())
-
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO payments (mp_payment_id, license_key, status, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (mp_payment_id, body.license_key, status, created_at))
-    conn.commit()
-    conn.close()
-
-    # retorno amigável pro Swagger / Front
-    poi = data.get("point_of_interaction", {}) or {}
-    tx = poi.get("transaction_data", {}) or {}
+    tx = (((data.get("point_of_interaction") or {}).get("transaction_data")) or {})
+    qr_code = tx.get("qr_code")
+    qr_code_base64 = tx.get("qr_code_base64")
+    ticket_url = tx.get("ticket_url")
 
     return {
-        "ok": True,
+        "mp_payment_id": data.get("id"),
+        "status": data.get("status"),
         "license_key": body.license_key,
-        "mp_payment_id": mp_payment_id,
-        "status": status,
-        "qr_code": tx.get("qr_code"),
-        "qr_code_base64": tx.get("qr_code_base64"),
-        "ticket_url": tx.get("ticket_url"),
+        "amount": body.amount,
+        "qr_code": qr_code,
+        "qr_code_base64": qr_code_base64,
+        "ticket_url": ticket_url,
+        "raw": data if not (qr_code or ticket_url) else None
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
