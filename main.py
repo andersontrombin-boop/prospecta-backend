@@ -13,8 +13,9 @@ from dotenv import load_dotenv
 # =========================
 load_dotenv()
 
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+BASE_URL = os.getenv("BASE_URL", "")
 DB_PATH = os.getenv("DB_PATH", "app.db")
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 
@@ -81,6 +82,8 @@ def iso(dt: datetime):
 
 
 def parse_iso(s: str) -> Optional[datetime]:
+    if not s:
+        return None
     try:
         return datetime.fromisoformat(s)
     except:
@@ -130,21 +133,24 @@ def validate_license(key: str):
     conn.close()
 
     if not row:
-        return {"valid": False}
+        return {"valid": False, "reason": "not_found"}
 
     paid_until = parse_iso(row["paid_until"])
 
     if row["status"] != "active":
-        return {"valid": False}
+        return {"valid": False, "reason": "inactive"}
 
     if paid_until and now() <= paid_until:
         return {"valid": True, "paid_until": row["paid_until"]}
 
-    return {"valid": False}
+    return {"valid": False, "reason": "expired"}
 
 
 @app.post("/pix/create")
 def create_pix(body: PixCreate):
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Mercado Pago não configurado")
+
     headers = {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Content-Type": "application/json"
@@ -152,18 +158,17 @@ def create_pix(body: PixCreate):
 
     payload = {
         "transaction_amount": body.amount,
-        "description": f"Licença {body.license_key}",
+        "description": f"Licença Prospecta {body.license_key}",
         "payment_method_id": "pix",
         "payer": {
-            "email": "test_user_123@test.com"
+            "email": "pagador@prospecta.app"
         }
     }
 
     response = requests.post(
         "https://api.mercadopago.com/v1/payments",
-        json=payload,
         headers=headers,
-        timeout=30
+        json=payload
     )
 
     if response.status_code not in (200, 201):
