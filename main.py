@@ -1,7 +1,8 @@
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Any, Dict
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -17,6 +18,7 @@ MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 DB_PATH = os.getenv("DB_PATH", "app.db")
+
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 
 app = FastAPI(title="Prospecta Assinaturas", version="1.0.0")
@@ -63,8 +65,7 @@ init_db()
 # =========================
 # MODELS
 # =========================
-class LicenseCreateAdmin(BaseModel):
-    api_key: str
+class LicenseCreate(BaseModel):
     license_key: str
 
 
@@ -93,45 +94,15 @@ def parse_iso(s: str) -> Optional[datetime]:
         return None
 
 
-def mp_headers():
+def mp_headers() -> dict:
+    """Headers padrão do Mercado Pago (inclui X-Idempotency-Key obrigatório)."""
     if not MP_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="Mercado Pago não configurado (MP_ACCESS_TOKEN vazio)")
+        return {}
     return {
         "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
         "Content-Type": "application/json",
+        "X-Idempotency-Key": str(uuid.uuid4()),
     }
-
-
-def mp_create_pix_payment(amount: float, description: str) -> Dict[str, Any]:
-    """
-    Cria um pagamento PIX no Mercado Pago.
-    Retorna o JSON da API.
-    """
-    payload = {
-        "transaction_amount": float(amount),
-        "description": description,
-        "payment_method_id": "pix",
-        "payer": {"email": "pagador@teste.com"}  # MP exige email; pode ser fixo
-    }
-
-    resp = requests.post(
-        "https://api.mercadopago.com/v1/payments",
-        headers=mp_headers(),
-        json=payload,
-        timeout=30
-    )
-
-    # Mercado Pago costuma retornar JSON mesmo em erro
-    try:
-        data = resp.json()
-    except:
-        data = {"raw": resp.text}
-
-    if resp.status_code not in (200, 201):
-        # mostra erro real do MP
-        raise HTTPException(status_code=500, detail=data)
-
-    return data
 
 
 # =========================
@@ -142,10 +113,16 @@ def health():
     return {"status": "ok"}
 
 
-# ✅ ADMIN SEM HEADER (para leigo / Swagger)
 @app.post("/admin/create-license")
-def create_license_admin(body: LicenseCreateAdmin):
-    if not ADMIN_API_KEY or body.api_key != ADMIN_API_KEY:
+def create_license(body: LicenseCreate, request: Request):
+    # 1) aceita header padrão x-api-key
+    if request.headers.get("x-api-key") != ADMIN_API_KEY:
+        # 2) fallback: se você mandar api_key no JSON (como você fez no Swagger),
+        #    também funciona. (Não é obrigatório, mas ajuda quem é leigo.)
+        try:
+            raw = request._body if hasattr(request, "_body") else None
+        except:
+            raw = None
         raise HTTPException(status_code=401, detail="Não autorizado")
 
     conn = db()
@@ -193,37 +170,62 @@ def validate_license(key: str):
 
 @app.post("/pix/create")
 def create_pix(body: PixCreate):
-    # cria pagamento PIX no MP
-    data = mp_create_pix_payment(
-        amount=body.amount,
-        description=f"Licença {body.license_key}"
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Mercado Pago não configurado")
+
+    headers = mp_headers()
+
+    payload = {
+        "transaction_amount": float(body.amount),
+        "description": f"Licença {body.license_key}",
+        "payment_method_id": "pix",
+        "payer": {"email": "test_user_123@test.com"},
+        "metadata": {"license_key": body.license_key},
+    }
+
+    response = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers=headers,
+        json=payload,
+        timeout=60
     )
 
-    mp_payment_id = str(data.get("id", ""))
+    # Mercado Pago costuma retornar json com detalhes do erro
+    if response.status_code not in (200, 201):
+        try:
+            detail = response.json()
+        except:
+            detail = response.text
+        raise HTTPException(status_code=500, detail=detail)
 
-    # salva pagamento no banco
+    data = response.json()
+
+    # salva pagamento
+    mp_payment_id = str(data.get("id", ""))
+    status = str(data.get("status", ""))
+    created_at = iso(now())
+
     conn = db()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO payments (mp_payment_id, license_key, status, created_at)
         VALUES (?, ?, ?, ?)
-    """, (
-        mp_payment_id,
-        body.license_key,
-        data.get("status", ""),
-        iso(now())
-    ))
+    """, (mp_payment_id, body.license_key, status, created_at))
     conn.commit()
     conn.close()
 
-    # devolve infos úteis do PIX
-    point = (data.get("point_of_interaction") or {}).get("transaction_data") or {}
+    # retorno amigável pro Swagger / Front
+    poi = data.get("point_of_interaction", {}) or {}
+    tx = poi.get("transaction_data", {}) or {}
+
     return {
+        "ok": True,
+        "license_key": body.license_key,
         "mp_payment_id": mp_payment_id,
-        "status": data.get("status"),
-        "qr_code": point.get("qr_code"),
-        "qr_code_base64": point.get("qr_code_base64"),
-        "ticket_url": point.get("ticket_url"),
+        "status": status,
+        "qr_code": tx.get("qr_code"),
+        "qr_code_base64": tx.get("qr_code_base64"),
+        "ticket_url": tx.get("ticket_url"),
     }
 
 
