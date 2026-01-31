@@ -2,7 +2,7 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Any, Dict
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -14,10 +14,9 @@ from dotenv import load_dotenv
 # =========================
 load_dotenv()
 
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 DB_PATH = os.getenv("DB_PATH", "app.db")
-
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 
 app = FastAPI(title="Prospecta Assinaturas", version="1.0.0")
@@ -47,7 +46,7 @@ def init_db():
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS payments (
-        mp_payment_id TEXT,
+        mp_payment_id TEXT PRIMARY KEY,
         license_key TEXT,
         status TEXT,
         created_at TEXT
@@ -66,8 +65,6 @@ init_db()
 # =========================
 class LicenseCreate(BaseModel):
     license_key: str
-    # ✅ Para funcionar no Swagger sem header
-    api_key: Optional[str] = None
 
 
 class PixCreate(BaseModel):
@@ -91,26 +88,58 @@ def parse_iso(s: str) -> Optional[datetime]:
         return None
     try:
         return datetime.fromisoformat(s)
-    except:
+    except Exception:
         return None
 
 
-def get_admin_key(request: Request, body_api_key: Optional[str]) -> str:
-    # ✅ Aceita header OU body
-    return (request.headers.get("x-api-key") or body_api_key or "").strip()
+def mp_headers(idempotency_key: Optional[str] = None):
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Mercado Pago não configurado (MP_ACCESS_TOKEN vazio).")
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    # MP pode exigir idempotency em alguns cenários
+    headers["X-Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
+    return headers
 
 
-def ensure_admin(request: Request, body_api_key: Optional[str]):
-    if not ADMIN_API_KEY:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY não configurado no Render")
+def mp_get_payment(payment_id: str) -> dict:
+    url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
+    r = requests.get(url, headers=mp_headers())
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Erro consultando pagamento MP: {r.status_code} - {r.text}")
+    return r.json()
 
-    sent = get_admin_key(request, body_api_key)
-    if sent != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Não autorizado")
+
+def extend_license(license_key: str, days: int):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM licenses WHERE license_key=?", (license_key,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Licença não encontrada")
+
+    paid_until = parse_iso(row["paid_until"])
+    base = paid_until if (paid_until and paid_until > now()) else now()
+    new_paid_until = base + timedelta(days=days)
+
+    cur.execute("""
+        UPDATE licenses
+        SET status=?, paid_until=?
+        WHERE license_key=?
+    """, ("active", iso(new_paid_until), license_key))
+
+    conn.commit()
+    conn.close()
+    return new_paid_until
 
 
 # =========================
-# ROTAS
+# ROTAS BÁSICAS
 # =========================
 @app.get("/health")
 def health():
@@ -119,7 +148,9 @@ def health():
 
 @app.post("/admin/create-license")
 def create_license(body: LicenseCreate, request: Request):
-    ensure_admin(request, body.api_key)
+    # Autorização via header x-api-key
+    if request.headers.get("x-api-key") != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Não autorizado")
 
     conn = db()
     cur = conn.cursor()
@@ -128,12 +159,7 @@ def create_license(body: LicenseCreate, request: Request):
         INSERT OR IGNORE INTO licenses
         (license_key, status, paid_until, created_at)
         VALUES (?, ?, ?, ?)
-    """, (
-        body.license_key,
-        "blocked",
-        "",
-        iso(now())
-    ))
+    """, (body.license_key, "blocked", "", iso(now())))
 
     conn.commit()
     conn.close()
@@ -164,69 +190,133 @@ def validate_license(key: str):
     return {"valid": False, "reason": "expired"}
 
 
+# =========================
+# PIX CREATE
+# =========================
 @app.post("/pix/create")
 def create_pix(body: PixCreate):
-    if not MP_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="Mercado Pago não configurado (MP_ACCESS_TOKEN vazio)")
-
-    # (Opcional) validar licença existe
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM licenses WHERE license_key=?", (body.license_key,))
-    lic = cur.fetchone()
-    conn.close()
-
-    if not lic:
-        raise HTTPException(status_code=404, detail="license_key não encontrada. Crie a licença antes.")
-
-    headers = {
-        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        # ✅ obrigatório pro MP não reclamar (idempotência)
-        "X-Idempotency-Key": str(uuid.uuid4()),
-    }
-
+    # cria pagamento Pix no MP
     payload = {
         "transaction_amount": float(body.amount),
         "description": f"Licença {body.license_key}",
         "payment_method_id": "pix",
-        # MP costuma aceitar sem payer em alguns casos, mas é mais estável mandar um email dummy
-        "payer": {
-            "email": "test_user_123@test.com"
-        }
+        "payer": {"email": "comprador@teste.com"},
+        # ajuda a você rastrear e vincular
+        "external_reference": body.license_key,
+        # opcional: expiração do qr (minutos)
+        # "date_of_expiration": (now() + timedelta(minutes=30)).isoformat()
     }
 
-    resp = requests.post(
+    r = requests.post(
         "https://api.mercadopago.com/v1/payments",
-        headers=headers,
+        headers=mp_headers(),  # já inclui X-Idempotency-Key
         json=payload,
-        timeout=60
+        timeout=60,
     )
 
-    # Mercado Pago manda erros detalhados no body
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=resp.text)
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=r.text)
 
-    data: Dict[str, Any] = resp.json()
+    data = r.json()
 
-    tx = (((data.get("point_of_interaction") or {}).get("transaction_data")) or {})
-    qr_code = tx.get("qr_code")
-    qr_code_base64 = tx.get("qr_code_base64")
-    ticket_url = tx.get("ticket_url")
+    payment_id = str(data.get("id"))
+    status = data.get("status")
 
+    # salva no banco
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO payments (mp_payment_id, license_key, status, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (payment_id, body.license_key, status, iso(now())))
+    conn.commit()
+    conn.close()
+
+    # retorna dados do QR / ticket
+    pix_info = (data.get("point_of_interaction") or {}).get("transaction_data") or {}
     return {
-        "mp_payment_id": data.get("id"),
-        "status": data.get("status"),
-        "license_key": body.license_key,
-        "amount": body.amount,
-        "qr_code": qr_code,
-        "qr_code_base64": qr_code_base64,
-        "ticket_url": ticket_url,
-        "raw": data if not (qr_code or ticket_url) else None
+        "mp_payment_id": payment_id,
+        "status": status,
+        "qr_code": pix_info.get("qr_code"),
+        "qr_code_base64": pix_info.get("qr_code_base64"),
+        "ticket_url": pix_info.get("ticket_url"),
     }
+
+
+# =========================
+# WEBHOOK MERCADO PAGO
+# =========================
+@app.post("/mp/webhook")
+async def mp_webhook(request: Request):
+    """
+    Mercado Pago chama algo como:
+    POST /mp/webhook?data.id=XXXXX&type=payment
+    """
+    # 1) pegar payment_id
+    payment_id = request.query_params.get("data.id")
+    event_type = request.query_params.get("type")
+
+    # fallback: às vezes vem no body
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if not payment_id:
+        payment_id = (
+            body.get("data", {}).get("id")
+            or body.get("id")
+            or body.get("data_id")
+        )
+
+    if not payment_id:
+        # responde 200 pra não ficar re-tentando infinito
+        return {"ok": True, "ignored": "no_payment_id"}
+
+    # Só tratar evento de pagamento
+    if event_type and event_type != "payment":
+        return {"ok": True, "ignored": f"type={event_type}"}
+
+    # 2) consultar pagamento no MP (fonte confiável)
+    mp = mp_get_payment(str(payment_id))
+    status = mp.get("status", "")
+    external_reference = mp.get("external_reference")  # deve ser license_key
+
+    # 3) achar a license_key
+    license_key = external_reference
+
+    if not license_key:
+        # tenta pelo nosso banco de payments
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM payments WHERE mp_payment_id=?", (str(payment_id),))
+        prow = cur.fetchone()
+        conn.close()
+        if prow:
+            license_key = prow["license_key"]
+
+    if not license_key:
+        return {"ok": True, "ignored": "no_license_key"}
+
+    # 4) gravar/atualizar pagamento
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO payments (mp_payment_id, license_key, status, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (str(payment_id), license_key, status, iso(now())))
+    conn.commit()
+    conn.close()
+
+    # 5) se aprovado, ativa/estende licença
+    if status == "approved":
+        new_until = extend_license(license_key, DEFAULT_BILLING_DAYS)
+        return {"ok": True, "payment_id": str(payment_id), "status": status, "license_key": license_key, "paid_until": iso(new_until)}
+
+    return {"ok": True, "payment_id": str(payment_id), "status": status, "license_key": license_key}
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
