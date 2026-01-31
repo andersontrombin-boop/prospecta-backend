@@ -1,357 +1,283 @@
+# =========================
+# CORREÇÃO PYINSTALLER
+# =========================
+import sys
 import os
-import json
-import sqlite3
+
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
+# =========================
+# IMPORTS
+# =========================
 import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
-
+import sqlite3
 import requests
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr
 
 # =========================
-# ENV / CONFIG
+# CONFIG ENV
 # =========================
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
-BASE_URL = os.getenv("BASE_URL", "").strip()  # ex: https://prospecta-backend-u79p.onrender.com
-DB_PATH = os.getenv("DB_PATH", "db.sqlite3").strip()
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "SENHA_FORTE123")
+MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+DB_PATH = os.getenv("DB_PATH", "app.db")
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 
-if not BASE_URL:
-    # fallback seguro para rodar local sem quebrar
-    BASE_URL = "http://localhost:8000"
-
-MP_PAYMENTS_URL = "https://api.mercadopago.com/v1/payments"
-
-# Email padrão (válido) para evitar erro "payer.email must be a valid email"
-DEFAULT_PAYER_EMAIL = os.getenv("DEFAULT_PAYER_EMAIL", "cliente@prospecta.app").strip()
-if "@" not in DEFAULT_PAYER_EMAIL or "." not in DEFAULT_PAYER_EMAIL:
-    DEFAULT_PAYER_EMAIL = "cliente@prospecta.app"
-
-
 # =========================
-# APP
+# FASTAPI
 # =========================
-app = FastAPI(title="Prospecta Assinaturas", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # ajuste se quiser travar
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="Prospecta Assinaturas",
+    version="1.0.0"
 )
 
 # =========================
-# DB
+# DATABASE
 # =========================
-def db_connect():
+def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def db_init():
-    conn = db_connect()
+def init_db():
+    conn = get_db()
     cur = conn.cursor()
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS licenses (
-        license_key TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        paid_until TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS payments (
-        payment_id TEXT PRIMARY KEY,
-        license_key TEXT NOT NULL,
-        amount REAL NOT NULL,
-        status TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        ticket_url TEXT,
-        qr_code TEXT,
-        qr_code_base64 TEXT,
-        raw_json TEXT,
-        FOREIGN KEY (license_key) REFERENCES licenses(license_key)
-    )
-    """)
-
-    conn.commit()
-    conn.close()
-
-db_init()
-
-# =========================
-# HELPERS
-# =========================
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-def parse_iso(dt: Optional[str]) -> Optional[datetime]:
-    if not dt:
-        return None
-    try:
-        return datetime.fromisoformat(dt.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-def add_days_iso(days: int) -> str:
-    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-
-def ensure_license_exists(license_key: str):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT license_key FROM licenses WHERE license_key = ?", (license_key,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute(
-            "INSERT INTO licenses (license_key, created_at, paid_until) VALUES (?, ?, ?)",
-            (license_key, now_iso(), None),
+        CREATE TABLE IF NOT EXISTS licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT UNIQUE,
+            expires_at TEXT,
+            active INTEGER
         )
-        conn.commit()
-    conn.close()
+    """)
 
-def set_license_paid(license_key: str, days: int = DEFAULT_BILLING_DAYS):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE licenses SET paid_until = ? WHERE license_key = ?", (add_days_iso(days), license_key))
-    conn.commit()
-    conn.close()
-
-def get_license(license_key: str) -> Optional[Dict[str, Any]]:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM licenses WHERE license_key = ?", (license_key,))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-def update_payment(payment_id: str, **fields):
-    conn = db_connect()
-    cur = conn.cursor()
-    sets = []
-    values = []
-    for k, v in fields.items():
-        sets.append(f"{k} = ?")
-        values.append(v)
-    sets.append("updated_at = ?")
-    values.append(now_iso())
-    values.append(payment_id)
-    cur.execute(f"UPDATE payments SET {', '.join(sets)} WHERE payment_id = ?", values)
-    conn.commit()
-    conn.close()
-
-def insert_payment(
-    payment_id: str,
-    license_key: str,
-    amount: float,
-    status: str,
-    ticket_url: Optional[str],
-    qr_code: Optional[str],
-    qr_code_base64: Optional[str],
-    raw_json: Optional[str],
-):
-    conn = db_connect()
-    cur = conn.cursor()
     cur.execute("""
-    INSERT OR REPLACE INTO payments
-    (payment_id, license_key, amount, status, created_at, updated_at, ticket_url, qr_code, qr_code_base64, raw_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        str(payment_id),
-        license_key,
-        float(amount),
-        status,
-        now_iso(),
-        now_iso(),
-        ticket_url,
-        qr_code,
-        qr_code_base64,
-        raw_json,
-    ))
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payment_id TEXT,
+            license_key TEXT,
+            status TEXT,
+            created_at TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
-def mp_headers(idempotency_key: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        "X-Idempotency-Key": idempotency_key,
-    }
-
-def mp_get_payment(payment_id: str) -> Dict[str, Any]:
-    url = f"{MP_PAYMENTS_URL}/{payment_id}"
-    r = requests.get(url, headers={"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}, timeout=30)
-    if r.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Erro ao buscar pagamento no MP: {r.status_code} - {r.text}")
-    return r.json()
+init_db()
 
 # =========================
-# SCHEMAS
+# MODELS
 # =========================
 class LicenseCreate(BaseModel):
-    api_key: str = Field(..., description="Chave ADMIN_API_KEY")
-    license_key: str = Field(..., description="Licença a ser criada")
+    api_key: str
+    license_key: str
 
 class PixCreate(BaseModel):
     license_key: str
     amount: float
-    payer_email: Optional[str] = Field(
-        default=None,
-        description="Opcional. Se não enviar, o sistema usa um e-mail padrão válido."
-    )
+    payer_email: EmailStr
 
 # =========================
-# ROUTES
+# HEALTH
 # =========================
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"status": "ok"}
 
+# =========================
+# CREATE LICENSE (ADMIN)
+# =========================
 @app.post("/admin/create-license")
-def create_license(body: LicenseCreate):
-    if not ADMIN_API_KEY:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY não configurada no Render (Environment).")
-
-    if body.api_key != ADMIN_API_KEY:
+def create_license(data: LicenseCreate):
+    if data.api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Não autorizado")
 
-    ensure_license_exists(body.license_key)
-    return {"ok": True, "license_key": body.license_key}
+    expires_at = datetime.utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)
 
-@app.get("/license/validate")
-def validate_license(key: str):
-    lic = get_license(key)
-    if not lic:
-        return {"valid": False}
-
-    paid_until = parse_iso(lic.get("paid_until"))
-    if paid_until and datetime.now(timezone.utc) <= paid_until:
-        return {"valid": True, "paid_until": lic.get("paid_until")}
-
-    return {"valid": False}
-
-@app.post("/pix/create")
-def create_pix(body: PixCreate):
-    if not MP_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="MP_ACCESS_TOKEN não configurado no Render (Environment).")
-
-    ensure_license_exists(body.license_key)
-
-    # ✅ CORREÇÃO PRINCIPAL: garantir um e-mail válido sempre
-    payer_email = (body.payer_email or DEFAULT_PAYER_EMAIL).strip()
-    if "@" not in payer_email or "." not in payer_email:
-        payer_email = DEFAULT_PAYER_EMAIL
-
-    idempotency_key = str(uuid.uuid4())
-
-    payload = {
-        "transaction_amount": float(body.amount),
-        "description": f"Licença {body.license_key}",
-        "payment_method_id": "pix",
-        "payer": {
-            "email": payer_email
-        },
-        "notification_url": f"{BASE_URL.rstrip('/')}/mp/webhook",
-        "external_reference": body.license_key,
-    }
+    conn = get_db()
+    cur = conn.cursor()
 
     try:
-        r = requests.post(
-            MP_PAYMENTS_URL,
-            headers=mp_headers(idempotency_key),
-            json=payload,
-            timeout=30
+        cur.execute(
+            "INSERT INTO licenses (license_key, expires_at, active) VALUES (?, ?, ?)",
+            (data.license_key, expires_at.isoformat(), 1)
         )
-    except requests.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Falha ao chamar Mercado Pago: {str(e)}")
-
-    if r.status_code not in (200, 201):
-        # repassa erro do MP para você ver no Swagger
-        raise HTTPException(status_code=500, detail=r.text)
-
-    data = r.json()
-
-    payment_id = str(data.get("id"))
-    status = data.get("status", "unknown")
-
-    poi = (data.get("point_of_interaction") or {}).get("transaction_data") or {}
-    ticket_url = poi.get("ticket_url")
-    qr_code = poi.get("qr_code")
-    qr_code_base64 = poi.get("qr_code_base64")
-
-    insert_payment(
-        payment_id=payment_id,
-        license_key=body.license_key,
-        amount=float(body.amount),
-        status=status,
-        ticket_url=ticket_url,
-        qr_code=qr_code,
-        qr_code_base64=qr_code_base64,
-        raw_json=json.dumps(data, ensure_ascii=False),
-    )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Licença já existe")
+    finally:
+        conn.close()
 
     return {
-        "payment_id": payment_id,
-        "status": status,
-        "ticket_url": ticket_url,
-        "qr_code": qr_code,
-        "qr_code_base64": qr_code_base64,
+        "ok": True,
+        "license_key": data.license_key,
+        "expires_at": expires_at
     }
 
-@app.post("/mp/webhook")
-async def mp_webhook(request: Request):
-    # MP manda query: ?data.id=XXXXX&type=payment
-    q = dict(request.query_params)
-    payment_id = q.get("data.id") or q.get("id")  # tolerância
-    event_type = q.get("type")
+# =========================
+# VALIDATE LICENSE
+# =========================
+@app.get("/license/validate")
+def validate_license(key: str):
+    conn = get_db()
+    cur = conn.cursor()
 
-    # Também pode mandar JSON no body (depende configuração)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    cur.execute(
+        "SELECT * FROM licenses WHERE license_key = ? AND active = 1",
+        (key,)
+    )
+    row = cur.fetchone()
+    conn.close()
 
-    if not payment_id:
-        # nada pra processar
-        return {"ok": True}
+    if not row:
+        raise HTTPException(status_code=404, detail="Licença inválida")
 
-    # Só processa pagamentos
-    if event_type and event_type != "payment":
-        return {"ok": True}
+    if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="Licença expirada")
 
-    # Busca status real no MP
-    mp_data = mp_get_payment(payment_id)
-    status = mp_data.get("status", "unknown")
+    return {
+        "ok": True,
+        "license_key": key,
+        "expires_at": row["expires_at"]
+    }
 
-    external_ref = mp_data.get("external_reference") or ""
-    license_key = external_ref.strip()
+# =========================
+# CREATE PIX
+# =========================
+@app.post("/pix/create")
+def create_pix(data: PixCreate):
+    conn = get_db()
+    cur = conn.cursor()
 
-    poi = (mp_data.get("point_of_interaction") or {}).get("transaction_data") or {}
-    ticket_url = poi.get("ticket_url")
-    qr_code = poi.get("qr_code")
-    qr_code_base64 = poi.get("qr_code_base64")
+    cur.execute(
+        "SELECT * FROM licenses WHERE license_key = ? AND active = 1",
+        (data.license_key,)
+    )
+    license_row = cur.fetchone()
 
-    # Atualiza payment no banco (se existir)
-    # Se não existir, salva mesmo assim
-    insert_payment(
-        payment_id=str(payment_id),
-        license_key=license_key or "UNKNOWN",
-        amount=float(mp_data.get("transaction_amount") or 0),
-        status=status,
-        ticket_url=ticket_url,
-        qr_code=qr_code,
-        qr_code_base64=qr_code_base64,
-        raw_json=json.dumps(mp_data, ensure_ascii=False),
+    if not license_row:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Licença inválida")
+
+    payment_payload = {
+        "transaction_amount": float(data.amount),
+        "description": "Prospecta Assinatura",
+        "payment_method_id": "pix",
+        "payer": {
+            "email": data.payer_email
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": str(uuid.uuid4())
+    }
+
+    response = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers=headers,
+        json=payment_payload
     )
 
-    # Se aprovado, ativa licença
-    if status == "approved" and license_key:
-        ensure_license_exists(license_key)
-        set_license_paid(license_key, DEFAULT_BILLING_DAYS)
+    if response.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=500,
+            detail=response.text
+        )
 
-    return {"ok": True, "payment_id": str(payment_id), "status": status}
+    payment = response.json()
+
+    cur.execute(
+        "INSERT INTO payments (payment_id, license_key, status, created_at) VALUES (?, ?, ?, ?)",
+        (
+            payment["id"],
+            data.license_key,
+            payment["status"],
+            datetime.utcnow().isoformat()
+        )
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "payment_id": payment["id"],
+        "status": payment["status"],
+        "qr_code": payment["point_of_interaction"]["transaction_data"]["qr_code"],
+        "qr_code_base64": payment["point_of_interaction"]["transaction_data"]["qr_code_base64"],
+        "ticket_url": payment["point_of_interaction"]["transaction_data"]["ticket_url"]
+    }
+
+# =========================
+# MERCADO PAGO WEBHOOK
+# =========================
+@app.post("/mp/webhook")
+async def mp_webhook(request: Request):
+    payload = await request.json()
+    payment_id = request.query_params.get("data.id")
+
+    if not payment_id:
+        return {"ok": True}
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}"
+    }
+
+    response = requests.get(
+        f"https://api.mercadopago.com/v1/payments/{payment_id}",
+        headers=headers
+    )
+
+    if response.status_code != 200:
+        return {"ok": False}
+
+    payment = response.json()
+    status = payment.get("status")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "UPDATE payments SET status = ? WHERE payment_id = ?",
+        (status, payment_id)
+    )
+
+    if status == "approved":
+        cur.execute(
+            """
+            UPDATE licenses
+            SET expires_at = ?
+            WHERE license_key = (
+                SELECT license_key FROM payments WHERE payment_id = ?
+            )
+            """,
+            (
+                (datetime.utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(),
+                payment_id
+            )
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        log_config=None,
+        use_colors=False
+    )
