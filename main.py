@@ -1,5 +1,5 @@
 # =========================
-# CORREÇÃO PYINSTALLER
+# CORREÇÃO PYINSTALLER / STDOUT
 # =========================
 import sys
 import os
@@ -16,15 +16,15 @@ import uuid
 import sqlite3
 import requests
 from datetime import datetime, timedelta
+
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 
 # =========================
 # CONFIG ENV
 # =========================
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "SENHA_FORTE123")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 DB_PATH = os.getenv("DB_PATH", "app.db")
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 
@@ -43,6 +43,7 @@ def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = get_db()
@@ -70,6 +71,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
 
 # =========================
@@ -79,10 +81,11 @@ class LicenseCreate(BaseModel):
     api_key: str
     license_key: str
 
+
 class PixCreate(BaseModel):
     license_key: str
     amount: float
-    payer_email: EmailStr
+    payer_email: str  # STRING SIMPLES (SEM EmailStr)
 
 # =========================
 # HEALTH
@@ -122,7 +125,7 @@ def create_license(data: LicenseCreate):
     }
 
 # =========================
-# VALIDATE LICENSE  ✅ (CORRIGIDO PARA RETORNAR valid)
+# VALIDATE LICENSE
 # =========================
 @app.get("/license/validate")
 def validate_license(key: str):
@@ -130,31 +133,21 @@ def validate_license(key: str):
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT license_key, expires_at, active FROM licenses WHERE license_key = ?",
+        "SELECT * FROM licenses WHERE license_key = ? AND active = 1",
         (key,)
     )
     row = cur.fetchone()
     conn.close()
 
-    # Se não existe
     if not row:
         return {"valid": False}
 
-    # Se está desativada
-    if int(row["active"]) != 1:
+    if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
         return {"valid": False}
 
-    # Se expirou
-    try:
-        if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
-            return {"valid": False}
-    except:
-        return {"valid": False}
-
-    # OK
     return {
         "valid": True,
-        "license_key": row["license_key"],
+        "license_key": key,
         "expires_at": row["expires_at"]
     }
 
@@ -163,126 +156,11 @@ def validate_license(key: str):
 # =========================
 @app.post("/pix/create")
 def create_pix(data: PixCreate):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT * FROM licenses WHERE license_key = ? AND active = 1",
-        (data.license_key,)
-    )
-    license_row = cur.fetchone()
-
-    if not license_row:
-        conn.close()
-        raise HTTPException(status_code=403, detail="Licença inválida")
-
-    payment_payload = {
-        "transaction_amount": float(data.amount),
-        "description": "Prospecta Assinatura",
-        "payment_method_id": "pix",
-        "payer": {"email": data.payer_email}
-    }
-
-    headers = {
-        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        "X-Idempotency-Key": str(uuid.uuid4())
-    }
-
-    response = requests.post(
-        "https://api.mercadopago.com/v1/payments",
-        headers=headers,
-        json=payment_payload
-    )
-
-    if response.status_code not in (200, 201):
-        raise HTTPException(status_code=500, detail=response.text)
-
-    payment = response.json()
-
-    cur.execute(
-        "INSERT INTO payments (payment_id, license_key, status, created_at) VALUES (?, ?, ?, ?)",
-        (
-            str(payment["id"]),
-            data.license_key,
-            payment.get("status", ""),
-            datetime.utcnow().isoformat()
-        )
-    )
-    conn.commit()
-    conn.close()
-
-    poi = payment.get("point_of_interaction", {}).get("transaction_data", {})
-
-    return {
-        "payment_id": payment.get("id"),
-        "status": payment.get("status"),
-        "qr_code": poi.get("qr_code"),
-        "qr_code_base64": poi.get("qr_code_base64"),
-        "ticket_url": poi.get("ticket_url")
-    }
-
-# =========================
-# MERCADO PAGO WEBHOOK
-# =========================
-@app.post("/mp/webhook")
-async def mp_webhook(request: Request):
-    payload = await request.json()
-    payment_id = request.query_params.get("data.id")
-
-    if not payment_id:
-        return {"ok": True}
-
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-
-    response = requests.get(
-        f"https://api.mercadopago.com/v1/payments/{payment_id}",
-        headers=headers
-    )
-
-    if response.status_code != 200:
-        return {"ok": False}
-
-    payment = response.json()
-    status = payment.get("status")
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Mercado Pago não configurado")
 
     conn = get_db()
     cur = conn.cursor()
 
     cur.execute(
-        "UPDATE payments SET status = ? WHERE payment_id = ?",
-        (status, str(payment_id))
-    )
-
-    if status == "approved":
-        cur.execute(
-            """
-            UPDATE licenses
-            SET expires_at = ?
-            WHERE license_key = (
-                SELECT license_key FROM payments WHERE payment_id = ?
-            )
-            """,
-            (
-                (datetime.utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(),
-                str(payment_id)
-            )
-        )
-
-    conn.commit()
-    conn.close()
-
-    return {"ok": True}
-
-# =========================
-# RUN
-# =========================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 8000)),
-        log_config=None,
-        use_colors=False
-    )
+        "SELECT * FROM licenses WHERE license_key = ? AND a_*
