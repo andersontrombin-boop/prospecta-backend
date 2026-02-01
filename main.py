@@ -163,4 +163,129 @@ def create_pix(data: PixCreate):
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT * FROM licenses WHERE license_key = ? AND a_*
+        "SELECT * FROM licenses WHERE license_key = ? AND active = 1",
+        (data.license_key,)
+    )
+    license_row = cur.fetchone()
+
+    if not license_row:
+        conn.close()
+        raise HTTPException(status_code=403, detail="Licença inválida")
+
+    payment_payload = {
+        "transaction_amount": float(data.amount),
+        "description": "Prospecta Assinatura",
+        "payment_method_id": "pix",
+        "payer": {
+            "email": data.payer_email
+        }
+    }
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": str(uuid.uuid4())
+    }
+
+    response = requests.post(
+        "https://api.mercadopago.com/v1/payments",
+        headers=headers,
+        json=payment_payload,
+        timeout=30
+    )
+
+    if response.status_code not in (200, 201):
+        raise HTTPException(status_code=500, detail=response.text)
+
+    payment = response.json()
+
+    cur.execute(
+        "INSERT INTO payments (payment_id, license_key, status, created_at) VALUES (?, ?, ?, ?)",
+        (
+            str(payment["id"]),
+            data.license_key,
+            payment["status"],
+            datetime.utcnow().isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    tx = payment["point_of_interaction"]["transaction_data"]
+
+    return {
+        "payment_id": payment["id"],
+        "status": payment["status"],
+        "qr_code": tx.get("qr_code"),
+        "qr_code_base64": tx.get("qr_code_base64"),
+        "ticket_url": tx.get("ticket_url")
+    }
+
+# =========================
+# MERCADO PAGO WEBHOOK
+# =========================
+@app.post("/mp/webhook")
+async def mp_webhook(request: Request):
+    payload = await request.json()
+    payment_id = request.query_params.get("data.id")
+
+    if not payment_id:
+        return {"ok": True}
+
+    headers = {
+        "Authorization": f"Bearer {MP_ACCESS_TOKEN}"
+    }
+
+    response = requests.get(
+        f"https://api.mercadopago.com/v1/payments/{payment_id}",
+        headers=headers,
+        timeout=30
+    )
+
+    if response.status_code != 200:
+        return {"ok": False}
+
+    payment = response.json()
+    status = payment.get("status")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "UPDATE payments SET status = ? WHERE payment_id = ?",
+        (status, str(payment_id))
+    )
+
+    if status == "approved":
+        cur.execute(
+            """
+            UPDATE licenses
+            SET expires_at = ?
+            WHERE license_key = (
+                SELECT license_key FROM payments WHERE payment_id = ?
+            )
+            """,
+            (
+                (datetime.utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(),
+                str(payment_id)
+            )
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {"ok": True}
+
+# =========================
+# RUN
+# =========================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        log_config=None,
+        use_colors=False
+    )
