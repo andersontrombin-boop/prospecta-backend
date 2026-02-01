@@ -118,11 +118,11 @@ def create_license(data: LicenseCreate):
     return {
         "ok": True,
         "license_key": data.license_key,
-        "expires_at": expires_at
+        "expires_at": expires_at.isoformat()
     }
 
 # =========================
-# VALIDATE LICENSE
+# VALIDATE LICENSE  ✅ (CORRIGIDO PARA RETORNAR valid)
 # =========================
 @app.get("/license/validate")
 def validate_license(key: str):
@@ -130,21 +130,31 @@ def validate_license(key: str):
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT * FROM licenses WHERE license_key = ? AND active = 1",
+        "SELECT license_key, expires_at, active FROM licenses WHERE license_key = ?",
         (key,)
     )
     row = cur.fetchone()
     conn.close()
 
+    # Se não existe
     if not row:
-        raise HTTPException(status_code=404, detail="Licença inválida")
+        return {"valid": False}
 
-    if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
-        raise HTTPException(status_code=403, detail="Licença expirada")
+    # Se está desativada
+    if int(row["active"]) != 1:
+        return {"valid": False}
 
+    # Se expirou
+    try:
+        if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
+            return {"valid": False}
+    except:
+        return {"valid": False}
+
+    # OK
     return {
-        "ok": True,
-        "license_key": key,
+        "valid": True,
+        "license_key": row["license_key"],
         "expires_at": row["expires_at"]
     }
 
@@ -170,9 +180,7 @@ def create_pix(data: PixCreate):
         "transaction_amount": float(data.amount),
         "description": "Prospecta Assinatura",
         "payment_method_id": "pix",
-        "payer": {
-            "email": data.payer_email
-        }
+        "payer": {"email": data.payer_email}
     }
 
     headers = {
@@ -188,31 +196,30 @@ def create_pix(data: PixCreate):
     )
 
     if response.status_code not in (200, 201):
-        raise HTTPException(
-            status_code=500,
-            detail=response.text
-        )
+        raise HTTPException(status_code=500, detail=response.text)
 
     payment = response.json()
 
     cur.execute(
         "INSERT INTO payments (payment_id, license_key, status, created_at) VALUES (?, ?, ?, ?)",
         (
-            payment["id"],
+            str(payment["id"]),
             data.license_key,
-            payment["status"],
+            payment.get("status", ""),
             datetime.utcnow().isoformat()
         )
     )
     conn.commit()
     conn.close()
 
+    poi = payment.get("point_of_interaction", {}).get("transaction_data", {})
+
     return {
-        "payment_id": payment["id"],
-        "status": payment["status"],
-        "qr_code": payment["point_of_interaction"]["transaction_data"]["qr_code"],
-        "qr_code_base64": payment["point_of_interaction"]["transaction_data"]["qr_code_base64"],
-        "ticket_url": payment["point_of_interaction"]["transaction_data"]["ticket_url"]
+        "payment_id": payment.get("id"),
+        "status": payment.get("status"),
+        "qr_code": poi.get("qr_code"),
+        "qr_code_base64": poi.get("qr_code_base64"),
+        "ticket_url": poi.get("ticket_url")
     }
 
 # =========================
@@ -226,9 +233,7 @@ async def mp_webhook(request: Request):
     if not payment_id:
         return {"ok": True}
 
-    headers = {
-        "Authorization": f"Bearer {MP_ACCESS_TOKEN}"
-    }
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
 
     response = requests.get(
         f"https://api.mercadopago.com/v1/payments/{payment_id}",
@@ -246,7 +251,7 @@ async def mp_webhook(request: Request):
 
     cur.execute(
         "UPDATE payments SET status = ? WHERE payment_id = ?",
-        (status, payment_id)
+        (status, str(payment_id))
     )
 
     if status == "approved":
@@ -260,7 +265,7 @@ async def mp_webhook(request: Request):
             """,
             (
                 (datetime.utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(),
-                payment_id
+                str(payment_id)
             )
         )
 
