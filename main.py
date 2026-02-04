@@ -14,11 +14,13 @@ if sys.stderr is None:
 # =========================
 import uuid
 import sqlite3
+import secrets
 import requests
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from typing import Optional, Literal
 
 # =========================
 # CONFIG ENV
@@ -26,6 +28,8 @@ from pydantic import BaseModel
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "SENHA_FORTE123")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "app.db")
+
+# Mantém seu padrão (30 dias) para mensal
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 
 # =========================
@@ -33,7 +37,7 @@ DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 # =========================
 app = FastAPI(
     title="Prospecta Assinaturas",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # =========================
@@ -44,6 +48,11 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def table_has_column(conn, table: str, column: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r["name"] for r in cur.fetchall()]
+    return column in cols
 
 def init_db():
     conn = get_db()
@@ -58,6 +67,18 @@ def init_db():
         )
     """)
 
+    # Migração: adiciona colunas novas se não existirem
+    if not table_has_column(conn, "licenses", "plan"):
+        cur.execute("ALTER TABLE licenses ADD COLUMN plan TEXT DEFAULT 'monthly'")
+    if not table_has_column(conn, "licenses", "issued_at"):
+        cur.execute("ALTER TABLE licenses ADD COLUMN issued_at TEXT")
+    if not table_has_column(conn, "licenses", "revoked"):
+        cur.execute("ALTER TABLE licenses ADD COLUMN revoked INTEGER DEFAULT 0")
+    if not table_has_column(conn, "licenses", "revoked_at"):
+        cur.execute("ALTER TABLE licenses ADD COLUMN revoked_at TEXT")
+    if not table_has_column(conn, "licenses", "revoke_reason"):
+        cur.execute("ALTER TABLE licenses ADD COLUMN revoke_reason TEXT")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,16 +92,33 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 init_db()
+
+# =========================
+# HELPERS
+# =========================
+def utcnow():
+    return datetime.utcnow()
+
+def compute_expiration(plan: Literal["trial", "monthly"]) -> datetime:
+    if plan == "trial":
+        return utcnow() + timedelta(hours=48)
+    # monthly
+    return utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)
+
+def gen_license_key() -> str:
+    # chave simples, forte e curta
+    return secrets.token_urlsafe(18).replace("-", "").replace("_", "")
 
 # =========================
 # MODELS
 # =========================
+PlanType = Literal["trial", "monthly"]
+
 class LicenseCreate(BaseModel):
     api_key: str
-    license_key: str
-
+    plan: PlanType  # trial=48h | monthly=30d
+    license_key: Optional[str] = None  # se não mandar, gera automático
 
 class PixCreate(BaseModel):
     license_key: str
@@ -102,15 +140,34 @@ def create_license(data: LicenseCreate):
     if data.api_key != ADMIN_API_KEY:
         raise HTTPException(status_code=401, detail="Não autorizado")
 
-    expires_at = datetime.utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)
+    plan = data.plan
+    issued_at = utcnow()
+    expires_at = compute_expiration(plan)
+
+    # Se não veio license_key, gera uma
+    license_key = (data.license_key or "").strip()
+    if not license_key:
+        license_key = gen_license_key()
 
     conn = get_db()
     cur = conn.cursor()
 
     try:
         cur.execute(
-            "INSERT INTO licenses (license_key, expires_at, active) VALUES (?, ?, ?)",
-            (data.license_key, expires_at.isoformat(), 1)
+            """
+            INSERT INTO licenses (license_key, expires_at, active, plan, issued_at, revoked, revoked_at, revoke_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                license_key,
+                expires_at.isoformat(),
+                1,
+                plan,
+                issued_at.isoformat(),
+                0,
+                None,
+                None
+            )
         )
         conn.commit()
     except sqlite3.IntegrityError:
@@ -120,20 +177,27 @@ def create_license(data: LicenseCreate):
 
     return {
         "ok": True,
-        "license_key": data.license_key,
+        "license_key": license_key,
+        "plan": plan,
+        "issued_at": issued_at.isoformat(),
         "expires_at": expires_at.isoformat()
     }
 
 # =========================
 # VALIDATE LICENSE
+# (Prospecta chama isso)
 # =========================
 @app.get("/license/validate")
 def validate_license(key: str):
+    key = (key or "").strip()
+    if not key:
+        return {"valid": False}
+
     conn = get_db()
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT * FROM licenses WHERE license_key = ? AND active = 1",
+        "SELECT * FROM licenses WHERE license_key = ?",
         (key,)
     )
     row = cur.fetchone()
@@ -142,12 +206,24 @@ def validate_license(key: str):
     if not row:
         return {"valid": False}
 
-    if datetime.fromisoformat(row["expires_at"]) < datetime.utcnow():
+    # precisa estar ativo e não revogado
+    if int(row["active"]) != 1:
+        return {"valid": False}
+
+    # coluna revoked pode ser NULL em registros antigos (por garantia)
+    revoked = row["revoked"]
+    if revoked is not None and int(revoked) == 1:
+        return {"valid": False}
+
+    # expiração
+    if datetime.fromisoformat(row["expires_at"]) < utcnow():
         return {"valid": False}
 
     return {
         "valid": True,
         "license_key": key,
+        "plan": row["plan"],
+        "issued_at": row["issued_at"],
         "expires_at": row["expires_at"]
     }
 
@@ -205,7 +281,7 @@ def create_pix(data: PixCreate):
             str(payment["id"]),
             data.license_key,
             payment["status"],
-            datetime.utcnow().isoformat()
+            utcnow().isoformat()
         )
     )
 
@@ -257,17 +333,18 @@ async def mp_webhook(request: Request):
         (status, str(payment_id))
     )
 
+    # Quando aprovado: renova como mensal (30 dias a partir de agora)
     if status == "approved":
         cur.execute(
             """
             UPDATE licenses
-            SET expires_at = ?
+            SET expires_at = ?, plan = 'monthly'
             WHERE license_key = (
                 SELECT license_key FROM payments WHERE payment_id = ?
             )
             """,
             (
-                (datetime.utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(),
+                (utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(),
                 str(payment_id)
             )
         )
