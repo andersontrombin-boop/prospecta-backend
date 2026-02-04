@@ -15,8 +15,6 @@ if sys.stderr is None:
 import uuid
 import sqlite3
 import secrets
-import hashlib
-import platform
 import requests
 from datetime import datetime, timedelta
 
@@ -25,12 +23,16 @@ from pydantic import BaseModel
 from typing import Optional, Literal
 
 # =========================
-# CONFIG ENV
+# CONFIG ENV (SEM FALLBACK)
 # =========================
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "SENHA_FORTE123")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "app.db")
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
+
+# Falha rápida e segura: se não tiver ADMIN_API_KEY, não sobe
+if not ADMIN_API_KEY or len(ADMIN_API_KEY.strip()) < 8:
+    raise RuntimeError("ADMIN_API_KEY não configurada (ou muito curta). Configure no Render > Environment.")
 
 # =========================
 # FASTAPI
@@ -373,7 +375,7 @@ def create_pix(data: PixCreate):
 # =========================
 @app.post("/mp/webhook")
 async def mp_webhook(request: Request):
-    payload = await request.json()
+    _payload = await request.json()
     payment_id = request.query_params.get("data.id")
 
     if not payment_id:
