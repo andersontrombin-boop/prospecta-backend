@@ -15,6 +15,8 @@ if sys.stderr is None:
 import uuid
 import sqlite3
 import secrets
+import hashlib
+import platform
 import requests
 from datetime import datetime, timedelta
 
@@ -28,8 +30,6 @@ from typing import Optional, Literal
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "SENHA_FORTE123")
 MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "app.db")
-
-# Mantém seu padrão (30 dias) para mensal
 DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 
 # =========================
@@ -37,7 +37,7 @@ DEFAULT_BILLING_DAYS = int(os.getenv("DEFAULT_BILLING_DAYS", "30"))
 # =========================
 app = FastAPI(
     title="Prospecta Assinaturas",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # =========================
@@ -67,7 +67,7 @@ def init_db():
         )
     """)
 
-    # Migração: adiciona colunas novas se não existirem
+    # Migrações (não quebram banco antigo)
     if not table_has_column(conn, "licenses", "plan"):
         cur.execute("ALTER TABLE licenses ADD COLUMN plan TEXT DEFAULT 'monthly'")
     if not table_has_column(conn, "licenses", "issued_at"):
@@ -78,6 +78,12 @@ def init_db():
         cur.execute("ALTER TABLE licenses ADD COLUMN revoked_at TEXT")
     if not table_has_column(conn, "licenses", "revoke_reason"):
         cur.execute("ALTER TABLE licenses ADD COLUMN revoke_reason TEXT")
+
+    # >>> TRAVA POR PC / ATIVAÇÃO ÚNICA <<<
+    if not table_has_column(conn, "licenses", "device_id"):
+        cur.execute("ALTER TABLE licenses ADD COLUMN device_id TEXT")  # PC vinculado
+    if not table_has_column(conn, "licenses", "activated_at"):
+        cur.execute("ALTER TABLE licenses ADD COLUMN activated_at TEXT")  # quando vinculou
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS payments (
@@ -103,11 +109,9 @@ def utcnow():
 def compute_expiration(plan: Literal["trial", "monthly"]) -> datetime:
     if plan == "trial":
         return utcnow() + timedelta(hours=48)
-    # monthly
     return utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)
 
 def gen_license_key() -> str:
-    # chave simples, forte e curta
     return secrets.token_urlsafe(18).replace("-", "").replace("_", "")
 
 # =========================
@@ -118,12 +122,17 @@ PlanType = Literal["trial", "monthly"]
 class LicenseCreate(BaseModel):
     api_key: str
     plan: PlanType  # trial=48h | monthly=30d
-    license_key: Optional[str] = None  # se não mandar, gera automático
+    license_key: Optional[str] = None
 
 class PixCreate(BaseModel):
     license_key: str
     amount: float
-    payer_email: str  # STRING SIMPLES (SEM EmailStr)
+    payer_email: str
+
+class AdminResetDevice(BaseModel):
+    api_key: str
+    license_key: str
+    reason: Optional[str] = None
 
 # =========================
 # HEALTH
@@ -144,7 +153,6 @@ def create_license(data: LicenseCreate):
     issued_at = utcnow()
     expires_at = compute_expiration(plan)
 
-    # Se não veio license_key, gera uma
     license_key = (data.license_key or "").strip()
     if not license_key:
         license_key = gen_license_key()
@@ -155,8 +163,12 @@ def create_license(data: LicenseCreate):
     try:
         cur.execute(
             """
-            INSERT INTO licenses (license_key, expires_at, active, plan, issued_at, revoked, revoked_at, revoke_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO licenses (
+              license_key, expires_at, active, plan, issued_at,
+              revoked, revoked_at, revoke_reason,
+              device_id, activated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 license_key,
@@ -166,6 +178,8 @@ def create_license(data: LicenseCreate):
                 issued_at.isoformat(),
                 0,
                 None,
+                None,
+                None,   # ainda não ativou em nenhum PC
                 None
             )
         )
@@ -180,52 +194,115 @@ def create_license(data: LicenseCreate):
         "license_key": license_key,
         "plan": plan,
         "issued_at": issued_at.isoformat(),
-        "expires_at": expires_at.isoformat()
+        "expires_at": expires_at.isoformat(),
+        "device_id": None,
+        "activated_at": None
     }
 
 # =========================
-# VALIDATE LICENSE
-# (Prospecta chama isso)
+# VALIDATE LICENSE (COM TRAVA POR PC)
+# Agora exige device_id.
+#
+# Fluxo:
+# 1) Se licença ainda NÃO tem device_id -> vincula no primeiro validate
+# 2) Se já tem device_id -> só valida se bater exatamente
 # =========================
 @app.get("/license/validate")
-def validate_license(key: str):
+def validate_license(key: str, device_id: str):
     key = (key or "").strip()
+    device_id = (device_id or "").strip()
+
     if not key:
-        return {"valid": False}
+        return {"valid": False, "reason": "missing_key"}
+    if not device_id or len(device_id) < 8:
+        return {"valid": False, "reason": "missing_device_id"}
 
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute(
-        "SELECT * FROM licenses WHERE license_key = ?",
-        (key,)
-    )
+    cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
     row = cur.fetchone()
-    conn.close()
 
     if not row:
-        return {"valid": False}
+        conn.close()
+        return {"valid": False, "reason": "not_found"}
 
-    # precisa estar ativo e não revogado
     if int(row["active"]) != 1:
-        return {"valid": False}
+        conn.close()
+        return {"valid": False, "reason": "inactive"}
 
-    # coluna revoked pode ser NULL em registros antigos (por garantia)
     revoked = row["revoked"]
     if revoked is not None and int(revoked) == 1:
-        return {"valid": False}
+        conn.close()
+        return {"valid": False, "reason": "revoked"}
 
-    # expiração
+    # Expiração
     if datetime.fromisoformat(row["expires_at"]) < utcnow():
-        return {"valid": False}
+        conn.close()
+        return {"valid": False, "reason": "expired"}
 
+    stored_device = (row["device_id"] or "").strip()
+
+    # Primeira ativação: vincula device_id (ativação única)
+    if not stored_device:
+        cur.execute(
+            "UPDATE licenses SET device_id = ?, activated_at = ? WHERE license_key = ?",
+            (device_id, utcnow().isoformat(), key)
+        )
+        conn.commit()
+        conn.close()
+        return {
+            "valid": True,
+            "bound": True,  # vinculou agora
+            "license_key": key,
+            "plan": row["plan"],
+            "issued_at": row["issued_at"],
+            "expires_at": row["expires_at"]
+        }
+
+    # Já vinculada: só aceita no mesmo PC
+    if stored_device != device_id:
+        conn.close()
+        return {"valid": False, "reason": "device_mismatch"}
+
+    conn.close()
     return {
         "valid": True,
+        "bound": False,
         "license_key": key,
         "plan": row["plan"],
         "issued_at": row["issued_at"],
         "expires_at": row["expires_at"]
     }
+
+# =========================
+# ADMIN: RESETAR VÍNCULO DE PC (quando cliente troca PC)
+# =========================
+@app.post("/admin/reset-device")
+def admin_reset_device(data: AdminResetDevice):
+    if data.api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Não autorizado")
+
+    key = (data.license_key or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="license_key obrigatório")
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Licença não encontrada")
+
+    cur.execute(
+        "UPDATE licenses SET device_id = NULL, activated_at = NULL WHERE license_key = ?",
+        (key,)
+    )
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "license_key": key, "reset": True, "reason": data.reason or "admin_reset"}
 
 # =========================
 # CREATE PIX
@@ -252,9 +329,7 @@ def create_pix(data: PixCreate):
         "transaction_amount": float(data.amount),
         "description": "Prospecta Assinatura",
         "payment_method_id": "pix",
-        "payer": {
-            "email": data.payer_email
-        }
+        "payer": {"email": data.payer_email}
     }
 
     headers = {
@@ -277,12 +352,7 @@ def create_pix(data: PixCreate):
 
     cur.execute(
         "INSERT INTO payments (payment_id, license_key, status, created_at) VALUES (?, ?, ?, ?)",
-        (
-            str(payment["id"]),
-            data.license_key,
-            payment["status"],
-            utcnow().isoformat()
-        )
+        (str(payment["id"]), data.license_key, payment["status"], utcnow().isoformat())
     )
 
     conn.commit()
@@ -309,9 +379,7 @@ async def mp_webhook(request: Request):
     if not payment_id:
         return {"ok": True}
 
-    headers = {
-        "Authorization": f"Bearer {MP_ACCESS_TOKEN}"
-    }
+    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
 
     response = requests.get(
         f"https://api.mercadopago.com/v1/payments/{payment_id}",
@@ -343,10 +411,7 @@ async def mp_webhook(request: Request):
                 SELECT license_key FROM payments WHERE payment_id = ?
             )
             """,
-            (
-                (utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(),
-                str(payment_id)
-            )
+            ((utcnow() + timedelta(days=DEFAULT_BILLING_DAYS)).isoformat(), str(payment_id))
         )
 
     conn.commit()
