@@ -3,3 +3,6 @@ uvicorn[standard]==0.34.0
 requests==2.32.3
 python-dotenv==1.0.1
 pydantic==2.10.6
+
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
