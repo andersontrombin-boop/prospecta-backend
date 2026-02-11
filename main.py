@@ -39,7 +39,7 @@ if not ADMIN_API_KEY or len(ADMIN_API_KEY.strip()) < 8:
 # =========================
 app = FastAPI(
     title="Prospecta Assinaturas",
-    version="1.2.0"
+    version="1.2.1"
 )
 
 # =========================
@@ -108,6 +108,14 @@ init_db()
 def utcnow():
     return datetime.utcnow()
 
+def parse_iso(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return datetime.fromisoformat(dt_str)
+    except Exception:
+        return None
+
 def compute_expiration(plan: Literal["trial", "monthly"]) -> datetime:
     if plan == "trial":
         return utcnow() + timedelta(hours=48)
@@ -116,10 +124,47 @@ def compute_expiration(plan: Literal["trial", "monthly"]) -> datetime:
 def gen_license_key() -> str:
     return secrets.token_urlsafe(18).replace("-", "").replace("_", "")
 
+def is_active_row(row: sqlite3.Row) -> bool:
+    # Ativa = active=1, não revogada, e não expirada
+    if int(row["active"] or 0) != 1:
+        return False
+    revoked = row["revoked"]
+    if revoked is not None and int(revoked) == 1:
+        return False
+    exp = parse_iso(row["expires_at"])
+    if exp is None:
+        return False
+    return exp >= utcnow()
+
+def serialize_license(row: sqlite3.Row) -> dict:
+    exp = row["expires_at"]
+    issued = row["issued_at"]
+    activated = row["activated_at"]
+    return {
+        "id": row["id"],
+        "license_key": row["license_key"],
+        "plan": row["plan"],
+        "issued_at": issued,
+        "expires_at": exp,
+        "active_flag": int(row["active"] or 0),
+        "revoked": int(row["revoked"] or 0),
+        "revoked_at": row["revoked_at"],
+        "revoke_reason": row["revoke_reason"],
+        "device_id": row["device_id"],
+        "activated_at": activated,
+        "status": (
+            "revoked" if (row["revoked"] is not None and int(row["revoked"]) == 1)
+            else "active" if is_active_row(row)
+            else "expired" if (parse_iso(row["expires_at"]) and parse_iso(row["expires_at"]) < utcnow())
+            else "inactive"
+        )
+    }
+
 # =========================
 # MODELS
 # =========================
 PlanType = Literal["trial", "monthly"]
+LicenseStatus = Literal["active", "expired", "trial", "revoked", "inactive", "all"]
 
 class LicenseCreate(BaseModel):
     api_key: str
@@ -202,6 +247,96 @@ def create_license(data: LicenseCreate):
     }
 
 # =========================
+# ✅ NEW: LIST LICENSES (ADMIN)
+# =========================
+@app.get("/admin/licenses")
+def admin_list_licenses(
+    api_key: str,
+    status: LicenseStatus = "all",
+    search: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0
+):
+    if api_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Não autorizado")
+
+    # limites seguros
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+    if offset < 0:
+        offset = 0
+
+    s = (search or "").strip()
+    like = f"%{s}%"
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    where = []
+    params = []
+
+    if s:
+        # Busca por partes relevantes
+        where.append("(license_key LIKE ? OR device_id LIKE ? OR plan LIKE ?)")
+        params.extend([like, like, like])
+
+    # Filtros por status
+    now_iso = utcnow().isoformat()
+
+    if status == "active":
+        where.append("(active = 1 AND (revoked IS NULL OR revoked = 0) AND expires_at >= ?)")
+        params.append(now_iso)
+
+    elif status == "expired":
+        where.append("(expires_at < ? AND (revoked IS NULL OR revoked = 0))")
+        params.append(now_iso)
+
+    elif status == "trial":
+        # trial ainda válido
+        where.append("(plan = 'trial' AND active = 1 AND (revoked IS NULL OR revoked = 0) AND expires_at >= ?)")
+        params.append(now_iso)
+
+    elif status == "revoked":
+        where.append("(revoked = 1)")
+
+    elif status == "inactive":
+        # inactive = flag desligado OU sem expires_at válido (geralmente não acontece)
+        where.append("(active != 1 OR active IS NULL)")
+
+    # Monta query
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = f"""
+        SELECT *
+        FROM licenses
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+    """
+    params.extend([limit, offset])
+
+    cur.execute(sql, tuple(params))
+    rows = cur.fetchall()
+
+    # total (para paginação)
+    count_sql = f"SELECT COUNT(1) as total FROM licenses{where_sql}"
+    cur.execute(count_sql, tuple(params[:-2]))  # sem limit/offset
+    total = int(cur.fetchone()["total"])
+
+    conn.close()
+
+    items = [serialize_license(r) for r in rows]
+
+    return {
+        "ok": True,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": items
+    }
+
+# =========================
 # VALIDATE LICENSE (COM TRAVA POR PC)
 # Agora exige device_id.
 #
@@ -239,7 +374,8 @@ def validate_license(key: str, device_id: str):
         return {"valid": False, "reason": "revoked"}
 
     # Expiração
-    if datetime.fromisoformat(row["expires_at"]) < utcnow():
+    exp = parse_iso(row["expires_at"])
+    if exp is None or exp < utcnow():
         conn.close()
         return {"valid": False, "reason": "expired"}
 
