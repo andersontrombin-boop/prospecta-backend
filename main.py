@@ -1,95 +1,45 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from datetime import datetime, timedelta
 import os
 import psycopg2
-import psycopg2.extras
+import traceback
+from fastapi import FastAPI
 
 app = FastAPI()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
 
+# =========================
+# CONEXÃO COM BANCO
+# =========================
 def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+    db_url = os.getenv("DATABASE_URL")
 
-# ===============================
-# MODELO
-# ===============================
+    if not db_url:
+        raise RuntimeError("DATABASE_URL não definido no Render")
 
-class ActivateRequest(BaseModel):
-    license_key: str
-    device_id: str
+    # garante sslmode=require
+    if "sslmode=" not in db_url:
+        sep = "&" if "?" in db_url else "?"
+        db_url = db_url + f"{sep}sslmode=require"
 
-# ===============================
-# HEALTH
-# ===============================
+    return psycopg2.connect(db_url)
 
+
+# =========================
+# HEALTH CHECK
+# =========================
 @app.get("/health")
 def health():
     try:
         conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        cur.fetchone()
+        cur.close()
         conn.close()
         return {"ok": True, "db": "connected"}
-    except:
-        return {"ok": False, "db": "error"}
-
-# ===============================
-# ATIVAR LICENÇA
-# ===============================
-
-@app.post("/activate")
-def activate(data: ActivateRequest):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-
-    # busca licença
-    cur.execute("SELECT * FROM licenses WHERE license_key = %s", (data.license_key,))
-    license = cur.fetchone()
-
-    if not license:
-        raise HTTPException(status_code=404, detail="Licença não encontrada")
-
-    if license["status"] != "active":
-        raise HTTPException(status_code=403, detail="Licença inativa")
-
-    license_id = license["id"]
-    license_type = license["license_type"]
-
-    # verifica se já existe ativação
-    cur.execute("""
-        SELECT * FROM license_activations
-        WHERE license_id = %s AND device_id = %s
-    """, (license_id, data.device_id))
-
-    existing = cur.fetchone()
-
-    if existing:
-        # verifica se expirou
-        if existing["expires_at"] < datetime.utcnow():
-            raise HTTPException(status_code=403, detail="Licença expirada")
-
+    except Exception as e:
+        traceback.print_exc()
         return {
-            "status": "ok",
-            "expires_at": existing["expires_at"]
+            "ok": False,
+            "db": "error",
+            "detail": str(e)
         }
-
-    # NOVA ATIVAÇÃO
-    if license_type == "trial":
-        expires_at = datetime.utcnow() + timedelta(hours=48)
-    else:
-        expires_at = datetime.utcnow() + timedelta(days=30)
-
-    try:
-        cur.execute("""
-            INSERT INTO license_activations
-            (license_id, device_id, license_type, expires_at)
-            VALUES (%s, %s, %s, %s)
-        """, (license_id, data.device_id, license_type, expires_at))
-        conn.commit()
-    except:
-        raise HTTPException(status_code=403, detail="Essa licença já foi usada neste dispositivo")
-
-    return {
-        "status": "activated",
-        "expires_at": expires_at
-    }
