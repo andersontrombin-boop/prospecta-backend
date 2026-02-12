@@ -1,52 +1,95 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from datetime import datetime, timedelta
 import os
-from fastapi import FastAPI
-from sqlalchemy import create_engine, text
+import psycopg2
+import psycopg2.extras
 
-app = FastAPI(title="Prospecta Backend", version="1.0.0")
+app = FastAPI()
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def get_database_url() -> str:
-    """
-    Render: usa DATABASE_URL nas env vars.
-    Importante: forçar o driver psycopg (v3) para evitar psycopg2.
-    """
-    url = os.getenv("DATABASE_URL", "").strip()
-    if not url:
-        raise RuntimeError("DATABASE_URL não definido nas variáveis do Render.")
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
 
-    # Força SQLAlchemy a usar psycopg v3 (não psycopg2)
-    # Aceita tanto postgresql:// quanto postgres://
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://") :]
+# ===============================
+# MODELO
+# ===============================
 
-    if url.startswith("postgresql://") and "postgresql+psycopg://" not in url:
-        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+class ActivateRequest(BaseModel):
+    license_key: str
+    device_id: str
 
-    # Garante SSL para Supabase (quase sempre necessário)
-    if "sslmode=" not in url:
-        joiner = "&" if "?" in url else "?"
-        url = url + f"{joiner}sslmode=require"
-
-    return url
-
-
-DATABASE_URL = get_database_url()
-
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=180,
-)
-
-
-@app.get("/")
-def root():
-    return {"ok": True, "service": "prospecta-backend"}
-
+# ===============================
+# HEALTH
+# ===============================
 
 @app.get("/health")
 def health():
-    # Teste real de conexão com o banco
-    with engine.connect() as conn:
-        conn.execute(text("select 1"))
-    return {"ok": True, "db": "connected"}
+    try:
+        conn = get_conn()
+        conn.close()
+        return {"ok": True, "db": "connected"}
+    except:
+        return {"ok": False, "db": "error"}
+
+# ===============================
+# ATIVAR LICENÇA
+# ===============================
+
+@app.post("/activate")
+def activate(data: ActivateRequest):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    # busca licença
+    cur.execute("SELECT * FROM licenses WHERE license_key = %s", (data.license_key,))
+    license = cur.fetchone()
+
+    if not license:
+        raise HTTPException(status_code=404, detail="Licença não encontrada")
+
+    if license["status"] != "active":
+        raise HTTPException(status_code=403, detail="Licença inativa")
+
+    license_id = license["id"]
+    license_type = license["license_type"]
+
+    # verifica se já existe ativação
+    cur.execute("""
+        SELECT * FROM license_activations
+        WHERE license_id = %s AND device_id = %s
+    """, (license_id, data.device_id))
+
+    existing = cur.fetchone()
+
+    if existing:
+        # verifica se expirou
+        if existing["expires_at"] < datetime.utcnow():
+            raise HTTPException(status_code=403, detail="Licença expirada")
+
+        return {
+            "status": "ok",
+            "expires_at": existing["expires_at"]
+        }
+
+    # NOVA ATIVAÇÃO
+    if license_type == "trial":
+        expires_at = datetime.utcnow() + timedelta(hours=48)
+    else:
+        expires_at = datetime.utcnow() + timedelta(days=30)
+
+    try:
+        cur.execute("""
+            INSERT INTO license_activations
+            (license_id, device_id, license_type, expires_at)
+            VALUES (%s, %s, %s, %s)
+        """, (license_id, data.device_id, license_type, expires_at))
+        conn.commit()
+    except:
+        raise HTTPException(status_code=403, detail="Essa licença já foi usada neste dispositivo")
+
+    return {
+        "status": "activated",
+        "expires_at": expires_at
+    }
