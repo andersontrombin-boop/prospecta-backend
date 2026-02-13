@@ -7,6 +7,7 @@ from typing import Optional, Literal, Any, Dict, List
 import psycopg
 from psycopg.errors import UniqueViolation
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # ✅ ADD
 from pydantic import BaseModel, Field
 
 # =========================
@@ -52,6 +53,21 @@ LicenseStatus = Literal["active", "blocked", "expired", "canceled"]
 
 app = FastAPI(title="Prospecta Backend", version="2.0.2")
 
+# =========================
+# ✅ CORS (para Painel Admin local)
+# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =========================
 # MODELS
