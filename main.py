@@ -22,7 +22,7 @@ def utcnow() -> datetime:
 
 
 def connect_db():
-    return psycopg.connect(DATABASE_URL, connect_timeout=8)
+    raise Exception("DB desativado")
 
 
 def fetchone_dict(cur) -> Optional[Dict[str, Any]]:
@@ -103,9 +103,9 @@ def health():
         return {"ok": False, "detail": str(e)}
 
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": "prospecta-backend"}
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 
 # =========================
